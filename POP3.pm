@@ -1,7 +1,7 @@
 # ==================================================================
 #   POE::Component::Client::POP3
 #   Author  : Scott Beck
-#   $Id: POP3.pm,v 1.5 2002/02/22 10:25:57 bline Exp $
+#   $Id: POP3.pm,v 1.6 2002/03/15 19:14:45 bline Exp $
 # ==================================================================
 #
 # Description: Impliment a POP3 client for POE
@@ -24,7 +24,7 @@ sub EOL         () { "\015\012" }
 sub STATE_AUTH  () { 0 }
 sub STATE_TRANS () { 1 }
 
-$VERSION = 0.01;
+$VERSION = 0.02;
 
 # Start things off
 
@@ -81,6 +81,7 @@ sub spawn {
             noop          => \&handler_noop,
             rset          => \&handler_rset,
             quit          => \&handler_quit,
+            stat          => \&handler_stat
         },
         heap => {
             alias       => $alias,
@@ -293,7 +294,7 @@ sub comm_list {
 
 # responce to either RETR or TOP
 
-*top = \&comm_retr;
+*comm_top = \&comm_retr;
 sub comm_retr {
     my ( $action, $input, $args ) = @_;
     my $heap = $poe_kernel->get_active_session()->get_heap();
@@ -338,8 +339,8 @@ sub comm_retr {
 
 # responce to DELE, NOOP, or RSET
 
-*noop = \&comm_dele;
-*rset = \&comm_dele;
+*comm_noop = \&comm_dele;
+*comm_rset = \&comm_dele;
 sub comm_dele {
     my ( $action, $input, $args ) = @_;
 
@@ -663,7 +664,7 @@ sub send_event {
 
 sub send_trans_error {
     my ( $state, $command, $input ) = @_;
-    $input =~ s/^-ERR\s*//i;
+    $input =~ s/^-ERR\s*//i if $input;
     send_event( 'trans_error', $state, $command, $input );
 }
 
@@ -671,7 +672,7 @@ sub send_trans_error {
 
 sub send_trans_event {
     my ( $event, $input, @args ) = @_;
-    $input =~ s/^\+OK\s*//i;
+    $input =~ s/^\+OK\s*//i if $input;
     send_event( $event, $input, @args );
 }
 

@@ -11,11 +11,12 @@
 use strict;
 use warnings;
 
-use Symbol qw(gensym);
-#sub POE::Component::Client::POP3::DEBUG () { 1 }
-sub POE::Kernel::ASSERT_RETURNS         () { 1 }
-sub DEBUG () { 0 }
+sub POE::Component::Client::POP3::DEBUG () { 1 }
 #sub POE::Kernel::TRACE_EVENTS           () { 1 }
+#sub POE::Kernel::ASSERT_RETURNS         () { 1 }
+sub DEBUG () { 1 }
+
+use Symbol qw(gensym);
 use POE qw/Wheel::ReadLine Component::Client::POP3/;
 use Term::ReadKey;
 
@@ -40,6 +41,11 @@ my %USAGE = (
                   "                   or | to a program the email. For example:",
                   "                      get 1 > /tmp/msg1",
                   "                   This would write message one to /tmp/msg1" ],
+    view     => [ "view number      - Retrieves message number into a temp file and executes",
+                  "                   an editor on the file. The editor is taken from the",
+                  "                   environment variable EDITOR, if EDITOR is not set vim is",
+                  "                   used."],
+    reset    => [ "reset            - Undeletes any message that were deleted" ],
     open     => [ "open host[:port] - Connect to host on port. port defaults to 110" ],
     connect  => [ "See open" ],
     retr     => [ "See get" ],
@@ -111,7 +117,7 @@ sub handler_term_input {
         }
         $heap->{wheel}->addhistory( $input );
         my ( $comm, $args ) = $input =~ /^\s*((?:\S+\b)|\?)\s*(.*)/;
-        $kernel->yield( "comm_$comm", $args );
+        $kernel->yield( "comm_$comm", $args, $comm );
     }
     else {
         $heap->{wheel}->get( $heap->{prompt} );
@@ -134,6 +140,7 @@ sub handler_pop_connect {
             retr          => 'pop_retr',
             uidl          => 'pop_uidl',
             top           => 'pop_top',
+            rset          => 'pop_rset',
             connected     => 'pop_connected'
         }]
     );
@@ -150,7 +157,12 @@ sub handler_user {
     }
     warn "$heap->{alias}: Changing state to state_pass" if DEBUG;
     $heap->{state} = STATE_PASS;
-    $heap->{wheel}->get( 'Password: ' );
+    if ( $heap->{wheel}->can( 'get_noecho' ) ) {
+        $heap->{wheel}->get_noecho( 'Password: ' );
+    }
+    else {
+        $heap->{wheel}->get( 'Password: ' );
+    }
 }
 
 sub handler_pass {
@@ -185,7 +197,7 @@ sub handler_comm_list {
 
 sub handler_comm_get {
 # ----------------------------------------------------------------------------
-    my ( $kernel, $heap, $args ) = @_[KERNEL, HEAP, ARG0];
+    my ( $kernel, $heap, $args, $comm ) = @_[KERNEL, HEAP, ARG0, ARG1];
     unless ( $heap->{state} == STATE_CONN ) {
         $heap->{wheel}->put( "Not connected" );
         $heap->{wheel}->get( PROMPT );
@@ -193,11 +205,18 @@ sub handler_comm_get {
     }
     my $num = $1 if $args =~ s/^\s*(\d+)//;
     unless ( defined $num ) {
-        $heap->{wheel}->put( "Must specify a number to get" );
+        $heap->{wheel}->put( "Must specify a number to $comm" );
         $heap->{wheel}->get( $heap->{prompt} );
         return;
     }
-    if ( $args =~ /^\s*([>\|])\s*(.+)\s*$/ ) {
+    if ( $comm eq 'view' ) {
+        $heap->{view} = "/tmp/$num." . time . ".eml";
+        my $fh = gensym;
+        open $fh, ">$heap->{view}"
+            or die "Could not open $heap->{view}; Reason: $!";
+        $kernel->post( 'pop_conn', 'retr', $num, $fh );
+    }
+    elsif ( $args =~ /^\s*([>\|])\s*(.+)\s*$/ ) {
         my ( $meth, $file ) = ( $1, $2 );
         if ( $meth eq '>' ) {
             my $fh = gensym;
@@ -211,8 +230,12 @@ sub handler_comm_get {
             }
         }
         else {
+            $heap->{retr_file} = "/tmp/$num." . time . ".eml";
+            my $fh = gensym;
+            open $fh, ">$heap->{retr_file}"
+                or die "Could not open $heap->{retr_file}; Reason: $!";
             $heap->{retr_pipe} = $file;
-            $kernel->post( 'pop_conn', 'retr', $num );
+            $kernel->post( 'pop_conn', 'retr', $num, $fh );
         }
     }
     else {
@@ -266,11 +289,29 @@ sub handler_comm_open {
     }
 }
 
+sub handler_comm_reset {
+# ----------------------------------------------------------------------------
+    my ( $kernel, $heap ) = @_[KERNEL, HEAP];
+    unless ( $heap->{state} == STATE_CONN ) {
+        $heap->{wheel}->put( "Not connected" );
+        $heap->{wheel}->get( PROMPT );
+        return;
+    }
+    $kernel->post( 'pop_conn', 'rset' );
+}
+
 sub handler_pop_connected {
+# ----------------------------------------------------------------------------
     my $heap = $_[HEAP];
     warn "$heap->{alias}: Changing state to state_user" if DEBUG;
     $heap->{state} = STATE_USER;
     $heap->{wheel}->get( 'Username: ' );
+}
+
+sub handler_pop_rset {
+# ----------------------------------------------------------------------------
+    my $heap = $_[HEAP];
+    $heap->{wheel}->get( $heap->{prompt} );
 }
 
 sub handler_comm_exit {
@@ -292,8 +333,14 @@ sub handler_pop_trans_error {
     # Servers usually disconnect you when your login is wrong
     if ( $heap->{state} == STATE_PASS ) {
         $heap->{state} = STATE_NOCONN;
+        $kernel->post( 'pop_conn', 'quit' );
+        $kernel->state( pop_disconnected => sub {
+            $heap->{wheel}->get( $heap->{prompt} );
+        } );
     }
-    $heap->{wheel}->get( $heap->{prompt} );
+    else {
+        $heap->{wheel}->get( $heap->{prompt} );
+    }
 }
 
 sub handler_pop_fatal_error {
@@ -312,15 +359,18 @@ sub handler_pop_retr {
 # ----------------------------------------------------------------------------
     my ( $kernel, $heap, $email, $number ) = @_[KERNEL, HEAP, ARG0, ARG1];
     
-    if ( my $exe = delete $heap->{retr_pipe} ) {
-        my $pipe = gensym;
-        open $pipe, "|$exe" or die "Could not open PIPE: $!";
-        for ( @$email ) {
-            print $pipe $_."\n";
-        }
-        close $pipe or die "Broken pipe: $?";
+    my $file;
+    if ( $file = delete $heap->{view} ) {
+        my $editor = $ENV{EDITOR} || 'vim';
+        $editor .= " -c 'set syn=mail'" if $editor eq 'vim';
+        system "$editor $file";
+        unlink $file;
     }
-    elsif ( my $file = delete $heap->{retr_file} ) {
+    elsif ( my $exe = delete $heap->{retr_pipe} ) {
+        system "cat $heap->{retr_file} | $exe";
+        unlink $heap->{retr_file};
+    }
+    elsif ( $file = delete $heap->{retr_file} ) {
         $heap->{wheel}->put( "Message $number downloaded to $file" );
     }
     else {
@@ -386,17 +436,11 @@ sub usage {
     else {
 
         $heap->{wheel}->put(
-            "help [command]   - Give a help message. command is optional",
-            "quit             - Given in connection stage when you want to",
-            "                   disconnect",
-            "exit             - To exit the program",
-            "list [number]    - List the size and number of each message. If",
-            "                   number is omited, lists all messages",
-            "get number       - Get a message. You may optionaly > to a file",
-            "                   or | to a program the email. For example:",
-            "                      get 1 > /tmp/msg1",
-            "                   This would write message one to /tmp/msg1",
-            "open host[:port] - Connect to host on port. port defaults to 110",
+            (
+                map @{$USAGE{$_}},
+                grep { $USAGE{$_}[0] !~ /^See / }
+                sort keys %USAGE
+            ),
             "",
             "The following commands are synonymous:",
             "       help ?",
@@ -425,6 +469,7 @@ POE::Session->create(
         pop_retr         => \&handler_pop_retr,
         pop_list         => \&handler_pop_list,
         pop_auth         => \&handler_pop_auth,
+        pop_rset         => \&handler_pop_rset,
         pop_disconnected => \&handler_pop_disconnected,
         comm_list        => \&handler_comm_list,
         comm_help        => \&handler_comm_help,
@@ -434,6 +479,8 @@ POE::Session->create(
         comm_exit        => \&handler_comm_exit,
         comm_list        => \&handler_comm_list,
         comm_ls          => \&handler_comm_list,
+        comm_reset       => \&handler_comm_reset,
+        comm_view        => \&handler_comm_get,
         comm_get         => \&handler_comm_get,
         comm_retr        => \&handler_comm_get,
         comm_retrieve    => \&handler_comm_get,

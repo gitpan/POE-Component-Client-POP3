@@ -1,10 +1,11 @@
 #!/usr/bin/perl -w
 
 use strict;
-use Test::More tests => 2;
+use Test;
 
 BEGIN {
-    use_ok( 'POE' );
-    use_ok( 'POE::Component::Client::POP3' );
+    plan tests => 2;
+    ok( sub { eval 'use POE'; $@ }, '' );
+    ok( sub { eval 'use POE::Component::Client::POP3'; $@ }, '' );
 }
 
